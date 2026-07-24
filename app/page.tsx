@@ -1,6 +1,9 @@
 "use client";
 
+import Image from "next/image";
 import { useEffect, useRef, useState } from "react";
+import jackflowIcon from "../images/jackflow-app-icon.png";
+import jackflowLogo from "../images/jackflow-logo-primary.png";
 
 type ModeId = "prompt" | "message" | "list" | "email";
 type TranscriptionModel =
@@ -497,8 +500,12 @@ export default function Home() {
     <main>
       <header className="site-header">
         <a className="brand" href="#top" aria-label="JackFlow Startseite">
-          <WaveMark small />
-          <span>JackFlow</span>
+          <Image
+            className="brand-logo"
+            src={jackflowLogo}
+            alt="JackFlow"
+            priority
+          />
         </a>
         <nav aria-label="Hauptnavigation">
           <a href="#studio">Produkt</a>
@@ -902,7 +909,12 @@ export default function Home() {
 
       <footer>
         <a className="brand brand--footer" href="#top">
-          <WaveMark small />
+          <Image
+            className="brand-icon"
+            src={jackflowIcon}
+            alt=""
+            aria-hidden
+          />
           <span>JackFlow</span>
         </a>
         <p>Eine eigenständige Voice-to-Text-Produktoberfläche.</p>

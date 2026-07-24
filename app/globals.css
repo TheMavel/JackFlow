@@ -78,6 +78,19 @@ a {
   letter-spacing: -0.04em;
 }
 
+.brand-logo {
+  display: block;
+  width: 132px;
+  height: auto;
+}
+
+.brand-icon {
+  display: block;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+}
+
 .wave-mark {
   display: inline-flex;
   align-items: center;
