@@ -8,6 +8,48 @@ type TranscriptionModel =
   | "gpt-4o-mini-transcribe"
   | "gpt-4o-transcribe";
 
+type SessionUser = {
+  id: string;
+  email: string;
+  name: string;
+  picture?: string;
+};
+
+type GoogleCredentialResponse = {
+  credential: string;
+};
+
+type GoogleIdentityApi = {
+  accounts: {
+    id: {
+      initialize: (options: {
+        client_id: string;
+        callback: (response: GoogleCredentialResponse) => void;
+        auto_select?: boolean;
+      }) => void;
+      renderButton: (
+        parent: HTMLElement,
+        options: {
+          type?: "standard" | "icon";
+          theme?: "outline" | "filled_blue" | "filled_black";
+          size?: "small" | "medium" | "large";
+          text?: "signin_with" | "signup_with" | "continue_with" | "signin";
+          shape?: "rectangular" | "pill" | "circle" | "square";
+          width?: number;
+          locale?: string;
+        },
+      ) => void;
+      disableAutoSelect: () => void;
+    };
+  };
+};
+
+declare global {
+  interface Window {
+    google?: GoogleIdentityApi;
+  }
+}
+
 const MODES: Record<
   ModeId,
   { label: string; eyebrow: string; title: string; sample: string }
@@ -119,11 +161,45 @@ export default function Home() {
   const [model, setModel] = useState<TranscriptionModel>("whisper-1");
   const [status, setStatus] = useState("Bereit zum Diktieren");
   const [copied, setCopied] = useState(false);
+  const [user, setUser] = useState<SessionUser | null>(null);
+  const [freeLimit, setFreeLimit] = useState(5);
+  const [freeRemaining, setFreeRemaining] = useState<number | null>(5);
+  const [googleConfigured, setGoogleConfigured] = useState(false);
+  const [googleClientId, setGoogleClientId] = useState<string | null>(null);
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [loginError, setLoginError] = useState("");
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
+  const googleButtonRef = useRef<HTMLDivElement | null>(null);
+  const googleInitializedRef = useRef(false);
 
   useEffect(() => {
+    void Promise.all([
+      fetch("/api/auth/session", { cache: "no-store" }).then((response) =>
+        response.json(),
+      ),
+      fetch("/api/auth/config", { cache: "no-store" }).then((response) =>
+        response.json(),
+      ),
+    ])
+      .then(([session, config]) => {
+        setUser(session.user ?? null);
+        setFreeLimit(session.freeLimit ?? 5);
+        setFreeRemaining(
+          typeof session.freeRemaining === "number"
+            ? session.freeRemaining
+            : null,
+        );
+        setGoogleConfigured(Boolean(config.configured));
+        setGoogleClientId(
+          typeof config.clientId === "string" ? config.clientId : null,
+        );
+      })
+      .catch(() => {
+        setLoginError("Der Anmeldestatus konnte nicht geladen werden.");
+      });
+
     return () => {
       if (mediaRecorderRef.current?.state === "recording") {
         mediaRecorderRef.current.stop();
@@ -131,6 +207,102 @@ export default function Home() {
       mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, []);
+
+  useEffect(() => {
+    if (!loginOpen || !googleClientId || user) return;
+
+    let cancelled = false;
+
+    async function handleCredential(response: GoogleCredentialResponse) {
+      setLoginError("");
+      try {
+        const loginResponse = await fetch("/api/auth/google", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ credential: response.credential }),
+        });
+        const result = (await loginResponse.json()) as {
+          user?: SessionUser;
+          error?: string;
+        };
+
+        if (!loginResponse.ok || !result.user) {
+          throw new Error(result.error || "Google-Login fehlgeschlagen.");
+        }
+
+        setUser(result.user);
+        setFreeRemaining(null);
+        setStatus(`Angemeldet als ${result.user.name}`);
+        setLoginOpen(false);
+      } catch (error) {
+        setLoginError(
+          error instanceof Error
+            ? error.message
+            : "Google-Login fehlgeschlagen.",
+        );
+      }
+    }
+
+    function renderGoogleButton() {
+      if (
+        cancelled ||
+        !window.google ||
+        !googleButtonRef.current ||
+        !googleClientId
+      ) {
+        return;
+      }
+
+      if (!googleInitializedRef.current) {
+        window.google.accounts.id.initialize({
+          client_id: googleClientId,
+          callback: (response) => {
+            void handleCredential(response);
+          },
+          auto_select: false,
+        });
+        googleInitializedRef.current = true;
+      }
+
+      googleButtonRef.current.replaceChildren();
+      window.google.accounts.id.renderButton(googleButtonRef.current, {
+        type: "standard",
+        theme: "outline",
+        size: "large",
+        text: "continue_with",
+        shape: "pill",
+        width: 290,
+        locale: "de",
+      });
+    }
+
+    const existingScript = document.getElementById("google-identity-services");
+    if (existingScript) {
+      renderGoogleButton();
+      existingScript.addEventListener("load", renderGoogleButton, {
+        once: true,
+      });
+    } else {
+      const script = document.createElement("script");
+      script.id = "google-identity-services";
+      script.src = "https://accounts.google.com/gsi/client?hl=de";
+      script.async = true;
+      script.defer = true;
+      script.addEventListener("load", renderGoogleButton, { once: true });
+      script.addEventListener(
+        "error",
+        () => setLoginError("Google Login konnte nicht geladen werden."),
+        { once: true },
+      );
+      document.head.appendChild(script);
+    }
+
+    return () => {
+      cancelled = true;
+    };
+  }, [googleClientId, loginOpen, user]);
 
   function changeMode(nextMode: ModeId) {
     if (isListening) stopListening();
@@ -163,13 +335,26 @@ export default function Home() {
       const result = (await response.json()) as {
         text?: string;
         error?: string;
+        code?: string;
+        freeRemaining?: number | null;
+        requiresLogin?: boolean;
       };
 
       if (!response.ok || !result.text) {
+        if (
+          result.code === "FREE_LIMIT_REACHED" ||
+          result.requiresLogin
+        ) {
+          setFreeRemaining(0);
+          setLoginOpen(true);
+        }
         throw new Error(result.error || "Die Aufnahme konnte nicht transkribiert werden.");
       }
 
       setText(autoPolish ? polishText(result.text, mode) : result.text);
+      if (typeof result.freeRemaining === "number") {
+        setFreeRemaining(result.freeRemaining);
+      }
       setStatus(
         autoPolish
           ? "Transkribiert · Füllwörter entfernt · Text formatiert"
@@ -189,6 +374,13 @@ export default function Home() {
   async function startListening() {
     if (isListening) {
       stopListening();
+      return;
+    }
+
+    if (!user && freeRemaining === 0) {
+      setLoginError("");
+      setLoginOpen(true);
+      setStatus("Melde dich mit Google an, um weiter zu transkribieren.");
       return;
     }
 
@@ -282,6 +474,25 @@ export default function Home() {
     window.setTimeout(() => setCopied(false), 1600);
   }
 
+  async function logout() {
+    await fetch("/api/auth/logout", { method: "POST" });
+    window.google?.accounts.id.disableAutoSelect();
+    setUser(null);
+    setStatus("Du bist abgemeldet.");
+
+    try {
+      const response = await fetch("/api/auth/session", { cache: "no-store" });
+      const session = await response.json();
+      setFreeRemaining(
+        typeof session.freeRemaining === "number"
+          ? session.freeRemaining
+          : freeLimit,
+      );
+    } catch {
+      setFreeRemaining(0);
+    }
+  }
+
   return (
     <main>
       <header className="site-header">
@@ -294,9 +505,28 @@ export default function Home() {
           <a href="#features">Funktionen</a>
           <a href="#privacy">Datenschutz</a>
         </nav>
-        <a className="header-cta" href="#studio">
-          Kostenlos ausprobieren <span>↗</span>
-        </a>
+        {user ? (
+          <button className="member-pill" type="button" onClick={() => void logout()}>
+            <span className="member-avatar" aria-hidden>
+              {user.name.charAt(0).toLocaleUpperCase("de-DE")}
+            </span>
+            <span className="member-copy">
+              <strong>{user.name}</strong>
+              <small>Abmelden</small>
+            </span>
+          </button>
+        ) : (
+          <button
+            className="header-cta"
+            type="button"
+            onClick={() => {
+              setLoginError("");
+              setLoginOpen(true);
+            }}
+          >
+            Mit Google anmelden <span>↗</span>
+          </button>
+        )}
       </header>
 
       <section className="hero" id="top">
@@ -488,6 +718,50 @@ export default function Home() {
               </select>
             </label>
 
+            <div className={`usage-box ${user ? "is-member" : ""}`}>
+              <div className="usage-topline">
+                <span>{user ? "Mitglied" : "Kostenlos testen"}</span>
+                <strong>{user ? "∞" : `${freeRemaining ?? 0}/${freeLimit}`}</strong>
+              </div>
+              {user ? (
+                <p>
+                  Angemeldet als <strong>{user.email}</strong>. Deine
+                  Transkriptionen sind freigeschaltet.
+                </p>
+              ) : (
+                <>
+                  <div
+                    className="usage-dots"
+                    aria-label={`${freeRemaining ?? 0} kostenlose Transkriptionen übrig`}
+                  >
+                    {Array.from({ length: freeLimit }, (_, index) => (
+                      <span
+                        key={index}
+                        className={
+                          index < (freeRemaining ?? 0) ? "is-available" : ""
+                        }
+                      />
+                    ))}
+                  </div>
+                  <p>
+                    Noch <strong>{freeRemaining ?? 0}</strong> kostenlose
+                    Transkriptionen. Danach ist ein Google-Login erforderlich.
+                  </p>
+                  {(freeRemaining ?? 0) === 0 && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setLoginError("");
+                        setLoginOpen(true);
+                      }}
+                    >
+                      Mit Google weitermachen
+                    </button>
+                  )}
+                </>
+              )}
+            </div>
+
             <div className="dictionary-box">
               <div className="dictionary-title">
                 <span>Persönliches Wörterbuch</span>
@@ -569,6 +843,62 @@ export default function Home() {
           Jetzt ausprobieren <span>↑</span>
         </a>
       </section>
+
+      {loginOpen && !user && (
+        <div
+          className="login-backdrop"
+          role="presentation"
+          onClick={(event) => {
+            if (event.currentTarget === event.target) setLoginOpen(false);
+          }}
+        >
+          <section
+            className="login-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="login-title"
+          >
+            <button
+              className="login-close"
+              type="button"
+              aria-label="Anmeldung schließen"
+              onClick={() => setLoginOpen(false)}
+            >
+              ×
+            </button>
+            <div className="login-mark">
+              <WaveMark small />
+            </div>
+            <span className="eyebrow">JackFlow Mitgliedschaft</span>
+            <h2 id="login-title">Weiterreden, ohne Limit.</h2>
+            <p>
+              Nach fünf kostenlosen Transkriptionen genügt dein Google-Konto.
+              Keine neue E-Mail-Adresse und kein zusätzliches Passwort.
+            </p>
+
+            <div className="login-benefits">
+              <span>✓ Direkt weiterschreiben</span>
+              <span>✓ Sicher angemeldet</span>
+              <span>✓ Jederzeit abmelden</span>
+            </div>
+
+            {googleConfigured ? (
+              <div className="google-button-slot" ref={googleButtonRef} />
+            ) : (
+              <div className="login-config-warning">
+                Google Login ist noch nicht konfiguriert. Ergänze
+                <code>GOOGLE_Client_ID</code> in deiner lokalen `.env`.
+              </div>
+            )}
+
+            {loginError && <p className="login-error">{loginError}</p>}
+            <small>
+              Mit der Anmeldung bestätigst du lediglich deine Identität über
+              Google. JackFlow erhält kein Google-Passwort.
+            </small>
+          </section>
+        </div>
+      )}
 
       <footer>
         <a className="brand brand--footer" href="#top">

@@ -1,3 +1,10 @@
+import {
+  FREE_TRANSCRIPTION_LIMIT,
+  createUsageCookie,
+  getAuthUser,
+  getGuestUsage,
+} from "../../lib/auth";
+
 const TRANSCRIPTION_MODELS = new Set([
   "whisper-1",
   "gpt-4o-mini-transcribe",
@@ -17,11 +24,30 @@ function json(body: Record<string, unknown>, status = 200) {
 
 export async function POST(request: Request) {
   const apiKey = process.env.OPENAI_API_KEY;
+  const user = await getAuthUser(request);
+  const guestUsage = user ? null : await getGuestUsage(request);
 
   if (!apiKey) {
     return json(
       { error: "Der OpenAI API-Schlüssel ist auf dem Server nicht eingerichtet." },
       503,
+    );
+  }
+
+  if (
+    !user &&
+    guestUsage &&
+    guestUsage.count >= FREE_TRANSCRIPTION_LIMIT
+  ) {
+    return json(
+      {
+        error:
+          "Deine fünf kostenlosen Transkriptionen sind aufgebraucht. Melde dich mit Google an, um weiterzumachen.",
+        code: "FREE_LIMIT_REACHED",
+        freeRemaining: 0,
+        requiresLogin: true,
+      },
+      403,
     );
   }
 
@@ -108,8 +134,28 @@ export async function POST(request: Request) {
     );
   }
 
-  return json({
+  const nextUsage =
+    !user && guestUsage
+      ? {
+          id: guestUsage.id,
+          count: guestUsage.count + 1,
+        }
+      : null;
+  const response = json({
     text: payload.text.trim(),
     model,
+    member: Boolean(user),
+    freeRemaining: nextUsage
+      ? Math.max(0, FREE_TRANSCRIPTION_LIMIT - nextUsage.count)
+      : null,
   });
+
+  if (nextUsage) {
+    response.headers.append(
+      "Set-Cookie",
+      await createUsageCookie(nextUsage, request),
+    );
+  }
+
+  return response;
 }
